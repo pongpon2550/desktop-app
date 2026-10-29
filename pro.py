@@ -74,6 +74,22 @@ def init_db():
         cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS people INTEGER;")
         cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS topic VARCHAR(255);")
 
+        # 4. ตาราง equipment_bookings
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS equipment_bookings (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                equipment_name VARCHAR(100) NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                booking_date DATE NOT NULL,
+                start_time TIME NOT NULL,
+                end_time TIME NOT NULL,
+                department VARCHAR(255),
+                purpose TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         # เพิ่มห้องประชุมเริ่มต้นหากยังไม่มี
         default_rooms = [
             ("ห้องประชุม A", 8, "ชั้น 2 - เหมาะสำหรับการประชุมกลุ่มย่อย"),
@@ -124,7 +140,7 @@ class LoginWindow:
     def __init__(self, root, on_login_success):
         self.root = root
         self.on_login_success = on_login_success
-        self.root.title("MeetSpace - เข้าสู่ระบบ")
+        self.root.title("KB Booking - เข้าสู่ระบบ")
         self.root.geometry("450x550")
         self.root.resizable(False, False)
         self.root.configure(bg=BG)
@@ -137,7 +153,7 @@ class LoginWindow:
         card.pack(expand=True, fill="both", padx=30, pady=30)
 
         # Header
-        tk.Label(card, text="MeetSpace", font=("Arial", 24, "bold"), bg=WHITE, fg=NAVY).pack(pady=(5, 2))
+        tk.Label(card, text="KB Booking", font=("Arial", 24, "bold"), bg=WHITE, fg=NAVY).pack(pady=(5, 2))
         tk.Label(card, text="ระบบจองห้องประชุมอัจฉริยะ", font=("Arial", 11), bg=WHITE, fg=TEXT_MUTED).pack(pady=(0, 20))
 
         tk.Label(card, text="เข้าสู่ระบบ", font=("Arial", 16, "bold"), bg=WHITE, fg=TEXT).pack(anchor="w", pady=(5, 12))
@@ -216,7 +232,7 @@ class LoginWindow:
 
     def open_register(self):
         reg = tk.Toplevel(self.root)
-        reg.title("สมัครสมาชิกใหม่ - MeetSpace")
+        reg.title("สมัครสมาชิกใหม่ - KB Booking")
         reg.geometry("400x480")
         reg.resizable(False, False)
         reg.configure(bg=BG)
@@ -283,13 +299,13 @@ class LoginWindow:
 
 
 # ==========================================
-# 4. แอปพลิเคชันหลัก MeetSpace (MeetingRoomApp)
+# 4. แอปพลิเคชันหลัก KB Booking (MeetingRoomApp)
 # ==========================================
 class MeetingRoomApp:
     def __init__(self, root, current_user):
         self.root = root
         self.current_user = current_user  # {"id": int, "username": str, "role": str}
-        self.root.title(f"MeetSpace - ระบบจองห้องประชุม ({self.current_user['username']})")
+        self.root.title(f"KB Booking - ระบบจองห้องประชุม ({self.current_user['username']})")
         self.root.geometry("1240x820")
         self.root.minsize(980, 700)
         self.root.configure(bg=BG)
@@ -297,6 +313,17 @@ class MeetingRoomApp:
         # ข้อมูลการจองจากฐานข้อมูล
         self.bookings = []
         self.rooms_data = {}  # {room_name: {"id": id, "capacity": cap, "description": desc}}
+
+        # รายการจองอุปกรณ์และคลังอุปกรณ์ (Stock)
+        self.equipment_bookings = []
+        self.equipment_stock = {
+            "โปรเจกเตอร์": 5,
+            "ไมโครโฟน": 10,
+            "ลำโพง": 4,
+            "โน้ตบุ๊ก": 8,
+            "สาย HDMI": 10,
+            "ปลั๊กพ่วง": 10
+        }
 
         # ตัวแปรแบบฟอร์มการจอง
         self.department = tk.StringVar()
@@ -338,6 +365,7 @@ class MeetingRoomApp:
 
         self.set_style()
         self.load_rooms_from_db()
+        self.fetch_equipment_bookings_from_db()
         self.create_menu()
         self.show_home()
 
@@ -424,6 +452,56 @@ class MeetingRoomApp:
             print("fetch_bookings_from_db error:", e)
             return []
 
+    def fetch_equipment_bookings_from_db(self):
+        """ดึงรายการจองอุปกรณ์ทั้งหมดจากฐานข้อมูล PostgreSQL หรือใช้ข้อมูลในหน่วยความจำ"""
+        conn = get_connection()
+        if not conn:
+            return self.equipment_bookings
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT 
+                    eb.id, 
+                    COALESCE(u.username, 'ไม่ระบุ') AS username, 
+                    eb.equipment_name, 
+                    eb.quantity, 
+                    eb.booking_date, 
+                    eb.start_time, 
+                    eb.end_time, 
+                    COALESCE(eb.department, '-') AS department, 
+                    COALESCE(eb.purpose, '-') AS purpose,
+                    eb.user_id
+                FROM equipment_bookings eb
+                LEFT JOIN users u ON eb.user_id = u.id
+                ORDER BY eb.booking_date DESC, eb.start_time DESC;
+            """)
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+
+            items = []
+            for r in rows:
+                b_date = r[4].isoformat() if hasattr(r[4], 'isoformat') else str(r[4])
+                s_time = str(r[5])[:5]
+                e_time = str(r[6])[:5]
+                items.append({
+                    "id": r[0],
+                    "username": r[1],
+                    "equipment": r[2],
+                    "quantity": r[3],
+                    "date": b_date,
+                    "start": s_time,
+                    "end": e_time,
+                    "department": r[7],
+                    "purpose": r[8],
+                    "user_id": r[9]
+                })
+            self.equipment_bookings = items
+            return items
+        except Exception as e:
+            print("fetch_equipment_bookings_from_db error:", e)
+            return self.equipment_bookings
+
     # ================= เมนูและการนำทาง =================
     def create_menu(self):
         self.sidebar = tk.Frame(self.root, bg=NAVY, width=240)
@@ -431,7 +509,7 @@ class MeetingRoomApp:
         self.sidebar.pack_propagate(False)
 
         # โลโก้และหัวข้อ
-        tk.Label(self.sidebar, text="MeetSpace", font=("Arial", 22, "bold"), bg=NAVY, fg=WHITE).pack(pady=(25, 4))
+        tk.Label(self.sidebar, text="KB Booking", font=("Arial", 22, "bold"), bg=NAVY, fg=WHITE).pack(pady=(25, 4))
         tk.Label(self.sidebar, text="ระบบจองห้องประชุม", font=("Arial", 10), bg=NAVY, fg="#93C5FD").pack(pady=(0, 20))
 
         # การ์ดแสดงผู้ใช้ที่ล็อกอินอยู่
@@ -447,6 +525,7 @@ class MeetingRoomApp:
         # ปุ่มเมนู
         self.menu_button("🏠 หน้าหลัก", self.show_home)
         self.menu_button("📅 จองห้องประชุม", self.show_booking)
+        self.menu_button("📦 จองอุปกรณ์", self.show_equipment_booking)
         self.menu_button("🏢 ข้อมูลห้องประชุม", self.show_rooms)
 
         # เมนูเฉพาะแอดมิน (Admin Dashboard)
@@ -502,9 +581,10 @@ class MeetingRoomApp:
     # ================= 1. หน้าหลัก (Home) =================
     def show_home(self):
         self.clear_page()
-        self.page_title("หน้าหลัก", "ภาพรวมการจองห้องประชุม MeetSpace เชื่อมต่อฐานข้อมูล")
+        self.page_title("หน้าหลัก", "ภาพรวมการจองห้องประชุม KB Booking เชื่อมต่อฐานข้อมูล")
 
         self.fetch_bookings_from_db()
+        self.fetch_equipment_bookings_from_db()
 
         today_str = date.today().isoformat()
         total_count = len(self.bookings)
@@ -655,7 +735,9 @@ class MeetingRoomApp:
 
         self.capacity_label = tk.Label(left, text="", font=("Arial", 9), bg=WHITE)
         self.capacity_label.pack(anchor="w", pady=(4, 0))
-        self.people.trace_add("write", self.check_people)
+        if not hasattr(self, "_people_traced"):
+            self.people.trace_add("write", self.check_people)
+            self._people_traced = True
 
         # หัวข้อการประชุม
         self.field_label(left, "หัวข้อการประชุม")
@@ -706,23 +788,32 @@ class MeetingRoomApp:
         self.check_people()
 
     def check_people(self, *args):
-        if not hasattr(self, "people_box"):
+        if not hasattr(self, "people_box") or not hasattr(self, "capacity_label"):
             return
+        try:
+            if not self.people_box.winfo_exists() or not self.capacity_label.winfo_exists():
+                return
+        except Exception:
+            return
+
         try:
             val = int(self.people.get())
         except (ValueError, tk.TclError):
             val = 0
 
         max_cap = self.rooms_data.get(self.room.get(), {}).get("capacity", 20)
-        if val < 1:
-            self.people_box.configure(foreground=RED)
-            self.capacity_label.config(text="กรุณากรอกอย่างน้อย 1 คน", fg=RED)
-        elif val > max_cap:
-            self.people_box.configure(foreground=RED)
-            self.capacity_label.config(text=f"เกินความจุ! ห้องนี้รองรับได้ {max_cap} คน", fg=RED)
-        else:
-            self.people_box.configure(foreground=TEXT)
-            self.capacity_label.config(text=f"ห้องนี้รองรับสูงสุด {max_cap} คน", fg=GREEN)
+        try:
+            if val < 1:
+                self.people_box.configure(foreground=RED)
+                self.capacity_label.config(text="กรุณากรอกอย่างน้อย 1 คน", fg=RED)
+            elif val > max_cap:
+                self.people_box.configure(foreground=RED)
+                self.capacity_label.config(text=f"เกินความจุ! ห้องนี้รองรับได้ {max_cap} คน", fg=RED)
+            else:
+                self.people_box.configure(foreground=TEXT)
+                self.capacity_label.config(text=f"ห้องนี้รองรับสูงสุด {max_cap} คน", fg=GREEN)
+        except Exception:
+            pass
 
     def room_changed(self, event=None):
         max_cap = self.rooms_data.get(self.room.get(), {}).get("capacity", 20)
@@ -981,6 +1072,344 @@ class MeetingRoomApp:
             conn.rollback()
             conn.close()
             messagebox.showerror("Database Error", f"เกิดข้อผิดพลาดในการบันทึก:\n{e}", parent=self.root)
+
+    # ================= 2.1 ระบบจองอุปกรณ์ (Equipment Booking) =================
+    def show_equipment_booking(self):
+        self.clear_page()
+        self.page_title("จองอุปกรณ์", "เลือกอุปกรณ์และกรอกข้อมูลสำหรับการจอง (เชื่อมต่อฐานข้อมูล)")
+
+        self.fetch_equipment_bookings_from_db()
+
+        self.eq_department = tk.StringVar(value=self.departments[0] if self.departments else "")
+        self.eq_name = tk.StringVar(value="โปรเจกเตอร์")
+        self.eq_quantity = tk.StringVar(value="1")
+        self.eq_date = tk.StringVar(value=date.today().isoformat())
+        self.eq_start = tk.StringVar(value="09:00")
+        self.eq_end = tk.StringVar(value="10:00")
+        self.eq_purpose = tk.StringVar()
+
+        content = tk.Frame(self.main, bg=BG)
+        content.pack(fill="both", expand=True, padx=30, pady=(0, 20))
+
+        # ฝั่งซ้าย: ฟอร์มการจองอุปกรณ์
+        left = tk.Frame(content, bg=WHITE, padx=22, pady=18, highlightbackground=BORDER, highlightthickness=1, width=380)
+        left.pack(side="left", fill="y", padx=(0, 15))
+        left.pack_propagate(False)
+
+        # ฝั่งขวา: สรุปคลังอุปกรณ์และตารางรายการจอง
+        right = tk.Frame(content, bg=WHITE, padx=20, pady=18, highlightbackground=BORDER, highlightthickness=1)
+        right.pack(side="left", fill="both", expand=True)
+
+        tk.Label(left, text="แบบฟอร์มจองอุปกรณ์", font=("Arial", 15, "bold"), bg=WHITE, fg=NAVY).pack(anchor="w")
+
+        # คณะ/หน่วยงาน
+        self.field_label(left, "คณะ / หน่วยงาน")
+        ttk.Combobox(
+            left, textvariable=self.eq_department, values=self.departments,
+            state="readonly", width=28
+        ).pack(fill="x")
+
+        # เลือกอุปกรณ์
+        self.field_label(left, "เลือกอุปกรณ์")
+        equipment_box = ttk.Combobox(
+            left, textvariable=self.eq_name, values=list(self.equipment_stock.keys()),
+            state="readonly", width=28
+        )
+        equipment_box.pack(fill="x")
+        equipment_box.bind("<<ComboboxSelected>>", lambda e: self.update_equipment_stock())
+
+        # ป้ายแสดงสต็อกคงเหลือ
+        self.stock_label = tk.Label(left, text="", bg=WHITE, fg=GREEN, font=("Arial", 9, "bold"))
+        self.stock_label.pack(anchor="w", pady=(4, 2))
+
+        # จำนวนที่ต้องการ
+        self.field_label(left, "จำนวนที่ต้องการจอง (ชิ้น)")
+        max_stock = self.equipment_stock.get(self.eq_name.get(), 10)
+        self.eq_qty_spin = ttk.Spinbox(
+            left, from_=1, to=max_stock, textvariable=self.eq_quantity, width=28
+        )
+        self.eq_qty_spin.pack(fill="x")
+
+        # วันที่จอง
+        self.field_label(left, "วันที่จอง (YYYY-MM-DD)")
+        tk.Entry(left, textvariable=self.eq_date, font=("Arial", 10), bg="#F8FAFC", relief="solid", bd=1).pack(fill="x", ipady=3)
+
+        # เวลาเริ่ม และ เวลาสิ้นสุด
+        time_frame = tk.Frame(left, bg=WHITE)
+        time_frame.pack(fill="x", pady=(6, 0))
+
+        tk.Label(time_frame, text="เวลาเริ่ม:", font=("Arial", 10), bg=WHITE, fg=NAVY).grid(row=0, column=0, sticky="w", pady=(0, 2))
+        tk.Label(time_frame, text="เวลาสิ้นสุด:", font=("Arial", 10), bg=WHITE, fg=NAVY).grid(row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 2))
+
+        start_times = [f"{h:02d}:00" for h in range(7, 23)]
+        end_times = [f"{h:02d}:00" for h in range(8, 24)]
+
+        start_cb = ttk.Combobox(time_frame, textvariable=self.eq_start, values=start_times, state="readonly", width=12)
+        start_cb.grid(row=1, column=0, sticky="ew")
+        start_cb.bind("<<ComboboxSelected>>", lambda e: self.update_equipment_stock())
+
+        end_cb = ttk.Combobox(time_frame, textvariable=self.eq_end, values=end_times, state="readonly", width=12)
+        end_cb.grid(row=1, column=1, sticky="ew", padx=(10, 0))
+        end_cb.bind("<<ComboboxSelected>>", lambda e: self.update_equipment_stock())
+
+        # วัตถุประสงค์
+        self.field_label(left, "วัตถุประสงค์การใช้งาน")
+        tk.Entry(left, textvariable=self.eq_purpose, font=("Arial", 10), bg="#F8FAFC", relief="solid", bd=1).pack(fill="x", ipady=3)
+
+        # ปุ่มบันทึก
+        self.make_button(left, "💾 บันทึกการจองอุปกรณ์", self.save_equipment_booking, GREEN).pack(fill="x", pady=(18, 6))
+
+        # ฝั่งขวา: รายการคงคลังอุปกรณ์ + ตาราง
+        top_right = tk.Frame(right, bg=WHITE)
+        top_right.pack(fill="x", pady=(0, 10))
+
+        tk.Label(top_right, text="📦 คลังอุปกรณ์ทั้งหมด", font=("Arial", 14, "bold"), bg=WHITE, fg=NAVY).pack(side="left")
+
+        # การ์ดแสดงอุปกรณ์ทั้งหมด
+        stock_cards = tk.Frame(right, bg=WHITE)
+        stock_cards.pack(fill="x", pady=(0, 15))
+
+        for eq, total in self.equipment_stock.items():
+            card = tk.Frame(stock_cards, bg="#F1F5F9", padx=10, pady=8, highlightbackground="#E2E8F0", highlightthickness=1)
+            card.pack(side="left", padx=4, pady=2, fill="x", expand=True)
+            tk.Label(card, text=eq, font=("Arial", 9, "bold"), bg="#F1F5F9", fg=TEXT).pack()
+            tk.Label(card, text=f"{total} ชิ้น", font=("Arial", 11, "bold"), bg="#F1F5F9", fg=BLUE).pack()
+
+        # ส่วนหัวตารางรายการจอง
+        table_hdr = tk.Frame(right, bg=WHITE)
+        table_hdr.pack(fill="x", pady=(5, 6))
+
+        tk.Label(table_hdr, text="📋 รายการจองอุปกรณ์", font=("Arial", 14, "bold"), bg=WHITE, fg=NAVY).pack(side="left")
+
+        btn_box = tk.Frame(table_hdr, bg=WHITE)
+        btn_box.pack(side="right")
+
+        tk.Button(
+            btn_box, text="🗑️ ยกเลิกรายการที่เลือก", command=self.delete_equipment_booking,
+            font=("Arial", 9), bg="#FEE2E2", fg=RED, relief="flat", padx=8, pady=3, cursor="hand2"
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            btn_box, text="🔄 รีเฟรช", command=self.show_equipment_booking,
+            font=("Arial", 9), bg=WHITE, fg=NAVY, relief="solid", bd=1, padx=8, pady=3, cursor="hand2"
+        ).pack(side="left")
+
+        # ตาราง Treeview
+        columns = ("id", "date", "time", "equipment", "quantity", "user", "department", "purpose")
+        self.equipment_table = ttk.Treeview(right, columns=columns, show="headings", selectmode="browse")
+
+        headers = [
+            ("id", "ID", 45),
+            ("date", "วันที่", 90),
+            ("time", "ช่วงเวลา", 105),
+            ("equipment", "อุปกรณ์", 110),
+            ("quantity", "จำนวน", 65),
+            ("user", "ผู้ขอจอง", 95),
+            ("department", "คณะ/หน่วยงาน", 140),
+            ("purpose", "วัตถุประสงค์", 160)
+        ]
+
+        for col, title, width in headers:
+            self.equipment_table.heading(col, text=title)
+            self.equipment_table.column(col, width=width, anchor="center")
+
+        self.equipment_table.column("purpose", anchor="w")
+        self.equipment_table.column("department", anchor="w")
+
+        eq_scroll = ttk.Scrollbar(right, orient="vertical", command=self.equipment_table.yview)
+        self.equipment_table.configure(yscrollcommand=eq_scroll.set)
+
+        self.equipment_table.pack(side="left", fill="both", expand=True)
+        eq_scroll.pack(side="right", fill="y")
+
+        self.update_equipment_stock()
+        self.refresh_equipment_table()
+
+    def update_equipment_stock(self):
+        if not hasattr(self, "stock_label"):
+            return
+        name = self.eq_name.get()
+        total = self.equipment_stock.get(name, 0)
+        
+        if hasattr(self, "eq_qty_spin"):
+            self.eq_qty_spin.configure(to=total)
+
+        b_date = self.eq_date.get().strip() if hasattr(self, "eq_date") else ""
+        start = self.eq_start.get() if hasattr(self, "eq_start") else ""
+        end = self.eq_end.get() if hasattr(self, "eq_end") else ""
+
+        already_booked = 0
+        if b_date and start and end:
+            for b in self.equipment_bookings:
+                if b["equipment"] == name and b["date"] == b_date:
+                    if start < b["end"] and end > b["start"]:
+                        already_booked += b["quantity"]
+
+        avail = max(0, total - already_booked)
+        self.stock_label.config(
+            text=f"ทั้งหมด: {total} ชิ้น  |  ว่างในช่วงเวลานี้: {avail} ชิ้น",
+            fg=GREEN if avail > 0 else RED
+        )
+
+    def save_equipment_booking(self):
+        dept = self.eq_department.get().strip()
+        equipment = self.eq_name.get().strip()
+        purpose = self.eq_purpose.get().strip()
+        booking_date = self.eq_date.get().strip()
+        start = self.eq_start.get().strip()
+        end = self.eq_end.get().strip()
+
+        if not dept or not purpose or not booking_date:
+            messagebox.showwarning("ข้อมูลไม่ครบ", "กรุณากรอกคณะ/หน่วยงาน วันที่ และวัตถุประสงค์", parent=self.root)
+            return
+
+        try:
+            date.fromisoformat(booking_date)
+        except ValueError:
+            messagebox.showwarning("วันที่ไม่ถูกต้อง", "กรุณากรอกวันที่ในรูปแบบ YYYY-MM-DD (เช่น 2026-10-29)", parent=self.root)
+            return
+
+        try:
+            quantity = int(self.eq_quantity.get())
+        except ValueError:
+            messagebox.showwarning("จำนวนไม่ถูกต้อง", "กรุณากรอกจำนวนเป็นตัวเลข", parent=self.root)
+            return
+
+        if quantity < 1:
+            messagebox.showwarning("จำนวนไม่ถูกต้อง", "จำนวนต้องมากกว่า 0", parent=self.root)
+            return
+
+        if not start or not end or end <= start:
+            messagebox.showwarning("เวลาไม่ถูกต้อง", "เวลาสิ้นสุดต้องมากกว่าเวลาเริ่ม", parent=self.root)
+            return
+
+        total_stock = self.equipment_stock.get(equipment, 0)
+        already_booked = 0
+
+        for b in self.equipment_bookings:
+            if b["equipment"] == equipment and b["date"] == booking_date:
+                if start < b["end"] and end > b["start"]:
+                    already_booked += b["quantity"]
+
+        available = total_stock - already_booked
+
+        if quantity > available:
+            messagebox.showwarning(
+                "อุปกรณ์ไม่เพียงพอ",
+                f"{equipment} เหลือว่างเพียง {available} ชิ้น ในช่วงเวลาที่เลือก (ขอจอง {quantity} ชิ้น)",
+                parent=self.root
+            )
+            return
+
+        # บันทึกลงฐานข้อมูล PostgreSQL (หรือทำงานต่อถ้า DB ไม่พร้อม)
+        conn = get_connection()
+        new_id = len(self.equipment_bookings) + 1
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO equipment_bookings (user_id, equipment_name, quantity, booking_date, start_time, end_time, department, purpose)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id;
+                """, (self.current_user["id"], equipment, quantity, booking_date, start, end, dept, purpose))
+                new_id = cur.fetchone()[0]
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception as e:
+                conn.rollback()
+                conn.close()
+                print("Save equipment to DB failed, fallback to memory:", e)
+
+        new_booking = {
+            "id": new_id,
+            "username": self.current_user["username"],
+            "date": booking_date,
+            "start": start,
+            "end": end,
+            "equipment": equipment,
+            "quantity": quantity,
+            "department": dept,
+            "purpose": purpose,
+            "user_id": self.current_user["id"]
+        }
+        self.equipment_bookings.insert(0, new_booking)
+
+        messagebox.showinfo(
+            "จองสำเร็จ",
+            f"จอง {equipment} สำเร็จ!\n"
+            f"วันที่: {booking_date}\n"
+            f"เวลา: {start} - {end}\n"
+            f"จำนวน: {quantity} ชิ้น\n"
+            f"ผู้จอง: {self.current_user['username']}",
+            parent=self.root
+        )
+
+        self.eq_purpose.set("")
+        self.fetch_equipment_bookings_from_db()
+        self.refresh_equipment_table()
+        self.update_equipment_stock()
+
+    def refresh_equipment_table(self):
+        if not hasattr(self, "equipment_table"):
+            return
+        for item in self.equipment_table.get_children():
+            self.equipment_table.delete(item)
+
+        for b in sorted(self.equipment_bookings, key=lambda x: (x["date"], x["start"]), reverse=True):
+            self.equipment_table.insert(
+                "", "end",
+                values=(
+                    b.get("id", "-"),
+                    b["date"],
+                    f"{b['start']} - {b['end']}",
+                    b["equipment"],
+                    f"{b['quantity']} ชิ้น",
+                    b.get("username", "-"),
+                    b["department"],
+                    b["purpose"]
+                )
+            )
+
+    def delete_equipment_booking(self):
+        if not hasattr(self, "equipment_table"):
+            return
+        selected = self.equipment_table.selection()
+        if not selected:
+            messagebox.showwarning("คำเตือน", "กรุณาเลือกรายการจองอุปกรณ์ที่ต้องการยกเลิก", parent=self.root)
+            return
+
+        values = self.equipment_table.item(selected[0])["values"]
+        b_id = values[0]
+        b_user = values[5]
+
+        # ตรวจสอบสิทธิ์: แอดมิน หรือ เจ้าของรายการจอง
+        is_admin = self.current_user["role"] == "admin"
+        is_owner = b_user == self.current_user["username"]
+        if not (is_admin or is_owner):
+            messagebox.showerror("ไม่มีสิทธิ์", "คุณสามารถยกเลิกได้เฉพาะรายการจองของคุณเองเท่านั้น", parent=self.root)
+            return
+
+        if not messagebox.askyesno("ยืนยัน", f"คุณต้องการยกเลิกรายการจองอุปกรณ์ ID #{b_id} ใช่หรือไม่?", parent=self.root):
+            return
+
+        conn = get_connection()
+        if conn and str(b_id).isdigit():
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM equipment_bookings WHERE id = %s;", (b_id,))
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception as e:
+                conn.rollback()
+                conn.close()
+                print("Delete equipment from DB failed:", e)
+
+        self.equipment_bookings = [b for b in self.equipment_bookings if str(b.get("id")) != str(b_id)]
+        messagebox.showinfo("สำเร็จ", f"ยกเลิกรายการจอง #{b_id} เรียบร้อยแล้ว", parent=self.root)
+        self.refresh_equipment_table()
+        self.update_equipment_stock()
 
     # ================= 3. ข้อมูลห้องประชุม (Rooms) =================
     def show_rooms(self):
