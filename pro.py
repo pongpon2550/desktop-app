@@ -99,6 +99,25 @@ def init_db():
         """)
         cur.execute("ALTER TABLE equipment_bookings ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'approved';")
 
+        # 6. ตาราง repair_requests (ระบบแจ้งซ่อม)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS repair_requests (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                title VARCHAR(255) NOT NULL,
+                location VARCHAR(255) NOT NULL,
+                category VARCHAR(100) NOT NULL DEFAULT 'ทั่วไป',
+                description TEXT,
+                status VARCHAR(30) NOT NULL DEFAULT 'รอดำเนินการ'
+                    CHECK (status IN ('รอดำเนินการ', 'กำลังดำเนินการ', 'เสร็จสิ้น', 'ยกเลิก')),
+                priority VARCHAR(20) NOT NULL DEFAULT 'ปกติ'
+                    CHECK (priority IN ('เร่งด่วน', 'ปกติ', 'ต่ำ')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                admin_note TEXT
+            );
+        """)
+
         # เพิ่มห้องประชุมเริ่มต้นหากยังไม่มี
         default_rooms = [
             ("ห้องประชุม A", 8, "ชั้น 2 - เหมาะสำหรับการประชุมกลุ่มย่อย"),
@@ -194,18 +213,27 @@ class LoginWindow:
         self.root = root
         self.on_login_success = on_login_success
         self.root.title("KB Booking - เข้าสู่ระบบ")
-        self.root.geometry("460x570")
+        self.root.geometry("460x680")
         self.root.resizable(False, False)
         self.root.configure(bg=BG)
 
-        self.center_window(460, 570)
+        self.center_window(460, 680)
 
         card = tk.Frame(self.root, bg=WHITE, padx=35, pady=30, highlightbackground=BORDER, highlightthickness=1)
         card.pack(expand=True, fill="both", padx=30, pady=30)
 
         # Header
-
-
+        try:
+            import os
+            logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "KB Booking Logo with Calendar Checkmark.png")
+            self.login_logo_img = tk.PhotoImage(file=logo_path)
+            orig_w = self.login_logo_img.width()
+            orig_h = self.login_logo_img.height()
+            subsample = max(1, min(orig_w // 80, orig_h // 80))
+            self.login_logo_img = self.login_logo_img.subsample(subsample, subsample)
+            tk.Label(card, image=self.login_logo_img, bg=WHITE).pack(pady=(0, 4))
+        except Exception:
+            pass
         tk.Label(card, text="KB Booking", font=(FONT_FAMILY, 26, "bold"), bg=WHITE, fg=NAVY).pack(pady=(2, 2))
         tk.Label(card, text="ระบบจองห้องประชุมและอุปกรณ์อัจฉริยะ", font=(FONT_FAMILY, 13), bg=WHITE, fg=TEXT_MUTED).pack(pady=(0, 16))
 
@@ -608,7 +636,18 @@ class MeetingRoomApp:
         self.sidebar.pack_propagate(False)
 
         # โลโก้และหัวข้อ
-        tk.Label(self.sidebar, text="KB Booking", font=(FONT_FAMILY, 24, "bold"), bg=NAVY, fg=WHITE).pack(pady=(22, 2))
+        try:
+            import os
+            logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "KB Booking Logo with Calendar Checkmark.png")
+            self.sidebar_logo_img = tk.PhotoImage(file=logo_path)
+            orig_w = self.sidebar_logo_img.width()
+            orig_h = self.sidebar_logo_img.height()
+            subsample = max(1, min(orig_w // 70, orig_h // 70))
+            self.sidebar_logo_img = self.sidebar_logo_img.subsample(subsample, subsample)
+            tk.Label(self.sidebar, image=self.sidebar_logo_img, bg=NAVY).pack(pady=(18, 2))
+        except Exception:
+            pass
+        tk.Label(self.sidebar, text="KB Booking", font=(FONT_FAMILY, 24, "bold"), bg=NAVY, fg=WHITE).pack(pady=(5, 2))
         tk.Label(self.sidebar, text="ระบบจองห้องประชุมและอุปกรณ์", font=(FONT_FAMILY, 13), bg=NAVY, fg="#93C5FD").pack(pady=(0, 16))
 
         # การ์ดแสดงผู้ใช้ที่ล็อกอินอยู่
@@ -626,10 +665,12 @@ class MeetingRoomApp:
         self.menu_button("📅 จองห้องประชุม", self.show_booking)
         self.menu_button("📦 จองอุปกรณ์", self.show_equipment_booking)
         self.menu_button("🏢 ข้อมูลห้องประชุม", self.show_rooms)
+        self.menu_button("🔧 แจ้งซ่อม", self.show_repair_request)
 
         # เมนูเฉพาะแอดมิน
         if self.current_user["role"] == "admin":
             self.menu_button("⚙️ จัดการการจอง (Admin)", self.show_admin_dashboard)
+            self.menu_button("🛠️ จัดการแจ้งซ่อม (Admin)", self.show_admin_repair_dashboard)
 
         spacer = tk.Frame(self.sidebar, bg=NAVY)
         spacer.pack(fill="both", expand=True)
@@ -2495,6 +2536,414 @@ class MeetingRoomApp:
             b_info = self.admin_booking_map[item_id]
             is_eq = (getattr(self, "admin_view_mode", "room") == "equipment")
             self.open_admin_verification_modal(b_info, is_equipment=is_eq)
+
+    # ==========================================
+    # ระบบแจ้งซ่อม (Repair Request System)
+    # ==========================================
+
+    def _fetch_repair_requests(self, my_only=False):
+        """ดึงรายการแจ้งซ่อมจาก DB หรือ fallback cache"""
+        conn = get_connection()
+        if not conn:
+            return getattr(self, "_repair_cache", [])
+        try:
+            cur = conn.cursor()
+            if my_only:
+                cur.execute("""
+                    SELECT r.id, COALESCE(u.username,'ไม่ระบุ'), r.title, r.location,
+                           r.category, r.description, r.status, r.priority,
+                           r.created_at, r.admin_note
+                    FROM repair_requests r LEFT JOIN users u ON r.user_id = u.id
+                    WHERE r.user_id = %s ORDER BY r.created_at DESC;
+                """, (self.current_user["id"],))
+            else:
+                cur.execute("""
+                    SELECT r.id, COALESCE(u.username,'ไม่ระบุ'), r.title, r.location,
+                           r.category, r.description, r.status, r.priority,
+                           r.created_at, r.admin_note
+                    FROM repair_requests r LEFT JOIN users u ON r.user_id = u.id
+                    ORDER BY r.created_at DESC;
+                """)
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            result = []
+            for r in rows:
+                result.append({
+                    "id": r[0], "username": r[1], "title": r[2],
+                    "location": r[3], "category": r[4], "description": r[5],
+                    "status": r[6], "priority": r[7],
+                    "created_at": str(r[8])[:16] if r[8] else "-",
+                    "admin_note": r[9] or ""
+                })
+            self._repair_cache = result
+            return result
+        except Exception as e:
+            print("fetch_repair_requests error:", e)
+            return getattr(self, "_repair_cache", [])
+
+    def show_repair_request(self):
+        """หน้าแจ้งซ่อมสำหรับผู้ใช้งานทุกคน"""
+        self.clear_page()
+        self.page_title("🔧 แจ้งซ่อม", "แจ้งปัญหาหรือขอซ่อมแซมอุปกรณ์ / ห้องประชุม")
+
+        top_bar = tk.Frame(self.main, bg=BG)
+        top_bar.pack(fill="x", padx=30, pady=(0, 10))
+        tk.Button(
+            top_bar, text="➕ แจ้งซ่อมใหม่", command=self._open_repair_form,
+            font=(FONT_FAMILY, 13, "bold"), bg=AMBER, fg=WHITE,
+            relief="flat", padx=12, pady=6, cursor="hand2"
+        ).pack(side="left")
+        tk.Button(
+            top_bar, text="🔄 รีเฟรช", command=self.show_repair_request,
+            font=(FONT_FAMILY, 13), bg=WHITE, fg=NAVY,
+            relief="solid", bd=1, padx=10, pady=5, cursor="hand2"
+        ).pack(side="left", padx=(8, 0))
+
+        frame = tk.Frame(self.main, bg=WHITE, highlightbackground=BORDER, highlightthickness=1)
+        frame.pack(fill="both", expand=True, padx=30, pady=(0, 10))
+
+        cols = ("id", "หัวข้อ", "สถานที่", "หมวดหมู่", "ความเร่งด่วน", "สถานะ", "วันที่แจ้ง", "หมายเหตุแอดมิน")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        col_widths = {"id": 50, "หัวข้อ": 180, "สถานที่": 130, "หมวดหมู่": 110,
+                      "ความเร่งด่วน": 100, "สถานะ": 120, "วันที่แจ้ง": 130, "หมายเหตุแอดมิน": 200}
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=col_widths.get(c, 100), anchor="center")
+
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        is_admin = self.current_user["role"] == "admin"
+        repairs = self._fetch_repair_requests(my_only=not is_admin)
+
+        STATUS_COLOR = {"รอดำเนินการ": "#FEF3C7", "กำลังดำเนินการ": "#DBEAFE",
+                        "เสร็จสิ้น": "#D1FAE5", "ยกเลิก": "#FEE2E2"}
+        self._repair_tree_map = {}
+        for rep in repairs:
+            tag = "s_" + rep["status"].replace(" ", "_")
+            iid = tree.insert("", "end", values=(
+                rep["id"], rep["title"], rep["location"], rep["category"],
+                rep["priority"], rep["status"], rep["created_at"], rep["admin_note"]
+            ), tags=(tag,))
+            self._repair_tree_map[iid] = rep
+            tree.tag_configure(tag, background=STATUS_COLOR.get(rep["status"], WHITE))
+
+        self._repair_tree = tree
+
+        btn_bar2 = tk.Frame(self.main, bg=BG)
+        btn_bar2.pack(fill="x", padx=30, pady=(0, 20))
+        tk.Button(
+            btn_bar2, text="🗑️ ยกเลิกรายการที่เลือก", command=self._cancel_repair,
+            font=(FONT_FAMILY, 13), bg="#FEE2E2", fg=RED,
+            relief="flat", padx=10, pady=5, cursor="hand2"
+        ).pack(side="left")
+
+    def _open_repair_form(self):
+        """ฟอร์มกรอกแจ้งซ่อมใหม่"""
+        win = tk.Toplevel(self.root)
+        win.title("แจ้งซ่อมใหม่ - KB Booking")
+        win.geometry("520x580")
+        win.resizable(False, False)
+        win.configure(bg=BG)
+        win.grab_set()
+
+        card = tk.Frame(win, bg=WHITE, padx=30, pady=25,
+                        highlightbackground=BORDER, highlightthickness=1)
+        card.pack(expand=True, fill="both", padx=25, pady=20)
+
+        tk.Label(card, text="📋 กรอกรายละเอียดแจ้งซ่อม",
+                 font=(FONT_FAMILY, 17, "bold"), bg=WHITE, fg=NAVY).pack(pady=(0, 15))
+
+        def lbl(t):
+            tk.Label(card, text=t, font=(FONT_FAMILY, 13, "bold"),
+                     bg=WHITE, fg=TEXT).pack(anchor="w", pady=(6, 2))
+
+        lbl("หัวข้อ / ชื่อปัญหา:")
+        e_title = tk.Entry(card, font=(FONT_FAMILY, 13), bg="#F8FAFC", relief="solid", bd=1)
+        e_title.pack(fill="x", ipady=5, pady=(0, 4))
+
+        lbl("สถานที่ / ห้อง:")
+        room_names = list(self.rooms_data.keys()) if self.rooms_data else ["ห้องประชุม A"]
+        location_choices = room_names + ["บริเวณทางเดิน", "ห้องน้ำ", "ที่จอดรถ", "อื่น ๆ"]
+        e_loc = ttk.Combobox(card, values=location_choices, font=(FONT_FAMILY, 13), state="normal")
+        e_loc.pack(fill="x", pady=(0, 4))
+        if room_names:
+            e_loc.set(room_names[0])
+
+        lbl("หมวดหมู่:")
+        e_cat = ttk.Combobox(card, values=[
+            "ไฟฟ้า", "ประปา", "โสตทัศนูปกรณ์", "เครื่องปรับอากาศ",
+            "เฟอร์นิเจอร์", "ระบบเครือข่าย", "ทั่วไป"
+        ], font=(FONT_FAMILY, 13), state="readonly")
+        e_cat.set("ทั่วไป")
+        e_cat.pack(fill="x", pady=(0, 4))
+
+        lbl("ระดับความเร่งด่วน:")
+        e_pri = ttk.Combobox(card, values=["เร่งด่วน", "ปกติ", "ต่ำ"],
+                             font=(FONT_FAMILY, 13), state="readonly")
+        e_pri.set("ปกติ")
+        e_pri.pack(fill="x", pady=(0, 4))
+
+        lbl("รายละเอียดปัญหา:")
+        e_desc = tk.Text(card, font=(FONT_FAMILY, 13), height=5, bg="#F8FAFC",
+                         relief="solid", bd=1, wrap="word")
+        e_desc.pack(fill="x", pady=(0, 10))
+
+        def do_submit():
+            title = e_title.get().strip()
+            location = e_loc.get().strip()
+            category = e_cat.get().strip() or "ทั่วไป"
+            priority = e_pri.get().strip() or "ปกติ"
+            description = e_desc.get("1.0", "end").strip()
+
+            if not title or not location:
+                messagebox.showwarning("คำเตือน", "กรุณากรอกหัวข้อและสถานที่", parent=win)
+                return
+
+            conn = get_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO repair_requests
+                            (user_id, title, location, category, priority, description)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (self.current_user["id"], title, location, category, priority, description))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                except Exception as e:
+                    conn.rollback()
+                    conn.close()
+                    messagebox.showerror("Error", f"บันทึกไม่สำเร็จ:\n{e}", parent=win)
+                    return
+            else:
+                # fallback: เก็บใน cache เมื่อไม่มี DB
+                import time
+                cache = getattr(self, "_repair_cache", [])
+                cache.insert(0, {
+                    "id": int(time.time()),
+                    "username": self.current_user["username"],
+                    "title": title, "location": location,
+                    "category": category, "description": description,
+                    "status": "รอดำเนินการ", "priority": priority,
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "admin_note": ""
+                })
+                self._repair_cache = cache
+
+            messagebox.showinfo("สำเร็จ", "แจ้งซ่อมเรียบร้อยแล้ว ระบบจะดำเนินการโดยเร็ว", parent=win)
+            win.destroy()
+            self.show_repair_request()
+
+        tk.Button(
+            card, text="📨 ส่งแจ้งซ่อม", command=do_submit,
+            font=(FONT_FAMILY, 14, "bold"), bg=AMBER, fg=WHITE,
+            relief="flat", cursor="hand2", pady=8
+        ).pack(fill="x", pady=(4, 0))
+
+    def _cancel_repair(self):
+        """ยกเลิกรายการแจ้งซ่อมที่เลือก"""
+        tree = getattr(self, "_repair_tree", None)
+        if not tree:
+            return
+        sel = tree.selection()
+        if not sel:
+            messagebox.showwarning("คำเตือน", "กรุณาเลือกรายการที่ต้องการยกเลิก", parent=self.root)
+            return
+        rep = self._repair_tree_map.get(sel[0])
+        if not rep:
+            return
+        if rep["status"] == "เสร็จสิ้น":
+            messagebox.showinfo("ไม่สามารถดำเนินการได้", "รายการที่เสร็จสิ้นแล้วไม่สามารถยกเลิกได้", parent=self.root)
+            return
+        if not messagebox.askyesno("ยืนยัน", f"ยืนยันยกเลิกรายการ: {rep['title']}?", parent=self.root):
+            return
+        conn = get_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                if self.current_user["role"] == "admin":
+                    cur.execute("DELETE FROM repair_requests WHERE id = %s;", (rep["id"],))
+                else:
+                    cur.execute(
+                        "UPDATE repair_requests SET status='ยกเลิก' WHERE id=%s AND user_id=%s;",
+                        (rep["id"], self.current_user["id"])
+                    )
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception as e:
+                conn.rollback()
+                conn.close()
+                messagebox.showerror("Error", str(e), parent=self.root)
+                return
+        else:
+            cache = getattr(self, "_repair_cache", [])
+            for item in cache:
+                if item["id"] == rep["id"]:
+                    item["status"] = "ยกเลิก"
+                    break
+        messagebox.showinfo("สำเร็จ", "ยกเลิกรายการแจ้งซ่อมเรียบร้อยแล้ว", parent=self.root)
+        self.show_repair_request()
+
+    def show_admin_repair_dashboard(self):
+        """หน้า Admin จัดการรายการแจ้งซ่อมทั้งหมด"""
+        self.clear_page()
+        self.page_title("🛠️ จัดการแจ้งซ่อม (Admin)", "ดูและอัปเดตสถานะรายการแจ้งซ่อมทั้งหมด")
+
+        top_bar = tk.Frame(self.main, bg=BG)
+        top_bar.pack(fill="x", padx=30, pady=(0, 10))
+        tk.Button(
+            top_bar, text="🔄 รีเฟรช", command=self.show_admin_repair_dashboard,
+            font=(FONT_FAMILY, 13), bg=WHITE, fg=NAVY, relief="solid", bd=1,
+            padx=10, pady=5, cursor="hand2"
+        ).pack(side="left")
+
+        frame = tk.Frame(self.main, bg=WHITE, highlightbackground=BORDER, highlightthickness=1)
+        frame.pack(fill="both", expand=True, padx=30, pady=(0, 10))
+
+        cols = ("id", "ผู้แจ้ง", "หัวข้อ", "สถานที่", "หมวดหมู่", "ความเร่งด่วน", "สถานะ", "วันที่แจ้ง")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        widths = {"id": 50, "ผู้แจ้ง": 100, "หัวข้อ": 180, "สถานที่": 130,
+                  "หมวดหมู่": 110, "ความเร่งด่วน": 100, "สถานะ": 120, "วันที่แจ้ง": 130}
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=widths.get(c, 100), anchor="center")
+
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        repairs = self._fetch_repair_requests(my_only=False)
+        STATUS_COLOR = {"รอดำเนินการ": "#FEF3C7", "กำลังดำเนินการ": "#DBEAFE",
+                        "เสร็จสิ้น": "#D1FAE5", "ยกเลิก": "#FEE2E2"}
+        self._admin_repair_map = {}
+        for rep in repairs:
+            tag = "s_" + rep["status"].replace(" ", "_")
+            iid = tree.insert("", "end", values=(
+                rep["id"], rep["username"], rep["title"], rep["location"],
+                rep["category"], rep["priority"], rep["status"], rep["created_at"]
+            ), tags=(tag,))
+            self._admin_repair_map[iid] = rep
+            tree.tag_configure(tag, background=STATUS_COLOR.get(rep["status"], WHITE))
+
+        self._admin_repair_tree = tree
+
+        # แผงอัปเดตสถานะ
+        action_frame = tk.Frame(self.main, bg=WHITE, highlightbackground=BORDER, highlightthickness=1)
+        action_frame.pack(fill="x", padx=30, pady=(0, 20))
+
+        inner = tk.Frame(action_frame, bg=WHITE, padx=20, pady=15)
+        inner.pack(fill="x")
+
+        tk.Label(inner, text="อัปเดตสถานะรายการที่เลือก:",
+                 font=(FONT_FAMILY, 13, "bold"), bg=WHITE, fg=NAVY).pack(anchor="w", pady=(0, 8))
+
+        btn_row = tk.Frame(inner, bg=WHITE)
+        btn_row.pack(fill="x")
+
+        for label, status, color in [
+            ("🔄 กำลังดำเนินการ", "กำลังดำเนินการ", BLUE),
+            ("✅ เสร็จสิ้น", "เสร็จสิ้น", GREEN),
+            ("❌ ยกเลิก", "ยกเลิก", RED),
+        ]:
+            tk.Button(
+                btn_row, text=label,
+                command=lambda s=status: self._admin_update_repair_status(s),
+                font=(FONT_FAMILY, 13, "bold"), bg=color, fg=WHITE,
+                relief="flat", padx=12, pady=6, cursor="hand2"
+            ).pack(side="left", padx=(0, 8))
+
+        tk.Label(inner, text="หมายเหตุแอดมิน (บันทึกพร้อมกับการอัปเดตสถานะ):",
+                 font=(FONT_FAMILY, 12), bg=WHITE, fg=TEXT_MUTED).pack(anchor="w", pady=(10, 3))
+        self._admin_note_entry = tk.Entry(inner, font=(FONT_FAMILY, 13), bg="#F8FAFC",
+                                          relief="solid", bd=1)
+        self._admin_note_entry.pack(fill="x", ipady=5)
+
+        tk.Button(
+            inner, text="🗑️ ลบรายการที่เลือก (ถาวร)",
+            command=self._admin_delete_repair,
+            font=(FONT_FAMILY, 12), bg="#64748B", fg=WHITE,
+            relief="flat", padx=10, pady=5, cursor="hand2"
+        ).pack(anchor="w", pady=(10, 0))
+
+    def _admin_update_repair_status(self, new_status):
+        """Admin อัปเดตสถานะแจ้งซ่อม"""
+        tree = getattr(self, "_admin_repair_tree", None)
+        if not tree:
+            return
+        sel = tree.selection()
+        if not sel:
+            messagebox.showwarning("คำเตือน", "กรุณาเลือกรายการก่อน", parent=self.root)
+            return
+        rep = self._admin_repair_map.get(sel[0])
+        if not rep:
+            return
+        note = self._admin_note_entry.get().strip() if hasattr(self, "_admin_note_entry") else ""
+        conn = get_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE repair_requests
+                    SET status=%s, admin_note=%s, updated_at=NOW()
+                    WHERE id=%s;
+                """, (new_status, note, rep["id"]))
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception as e:
+                conn.rollback()
+                conn.close()
+                messagebox.showerror("Error", str(e), parent=self.root)
+                return
+        else:
+            cache = getattr(self, "_repair_cache", [])
+            for item in cache:
+                if item["id"] == rep["id"]:
+                    item["status"] = new_status
+                    item["admin_note"] = note
+                    break
+        messagebox.showinfo("สำเร็จ", f"อัปเดตสถานะเป็น '{new_status}' เรียบร้อยแล้ว", parent=self.root)
+        self.show_admin_repair_dashboard()
+
+    def _admin_delete_repair(self):
+        """Admin ลบรายการแจ้งซ่อมถาวร"""
+        tree = getattr(self, "_admin_repair_tree", None)
+        if not tree:
+            return
+        sel = tree.selection()
+        if not sel:
+            messagebox.showwarning("คำเตือน", "กรุณาเลือกรายการก่อน", parent=self.root)
+            return
+        rep = self._admin_repair_map.get(sel[0])
+        if not rep:
+            return
+        if not messagebox.askyesno("ยืนยัน", f"ลบรายการ ID #{rep['id']} ถาวรใช่หรือไม่?", parent=self.root):
+            return
+        conn = get_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM repair_requests WHERE id=%s;", (rep["id"],))
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception as e:
+                conn.rollback()
+                conn.close()
+                messagebox.showerror("Error", str(e), parent=self.root)
+                return
+        else:
+            cache = getattr(self, "_repair_cache", [])
+            self._repair_cache = [x for x in cache if x["id"] != rep["id"]]
+        messagebox.showinfo("สำเร็จ", "ลบรายการเรียบร้อยแล้ว", parent=self.root)
+        self.show_admin_repair_dashboard()
 
 
 # ==========================================
